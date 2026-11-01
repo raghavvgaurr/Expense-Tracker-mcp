@@ -1,13 +1,16 @@
 
+import asyncio
 import json
 import math
+import os
 import re
-import sqlite3
 
-from pathlib import Path
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
+import aiosqlite
 from fastmcp import FastMCP
 
 
@@ -20,24 +23,49 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "expenses.db"
 CATEGORY_FILE = BASE_DIR / "categories.json"
 
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+
 mcp = FastMCP("ExpenseTracker")
 
 
 # =========================================================
-# DATABASE
+# DATABASE CONNECTION
 # =========================================================
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+@asynccontextmanager
+async def get_db():
+    """
+    Open an asynchronous SQLite connection.
+
+    Each request gets its own connection. WAL mode and
+    busy_timeout are configured during database startup.
+    """
+    conn = await aiosqlite.connect(
+        str(DB_PATH),
+        timeout=10
+    )
+
+    conn.row_factory = aiosqlite.Row
+
+    try:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.execute("PRAGMA busy_timeout = 10000")
+
+        yield conn
+
+    finally:
+        await conn.close()
 
 
-def init_db():
-    with get_db() as conn:
+async def init_db():
+    """Initialize database tables without deleting existing data."""
 
-        conn.execute("""
+    async with get_db() as conn:
+
+        await conn.execute("PRAGMA journal_mode = WAL")
+
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT NOT NULL,
@@ -48,7 +76,7 @@ def init_db():
             )
         """)
 
-        conn.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS budgets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category TEXT NOT NULL,
@@ -58,8 +86,7 @@ def init_db():
             )
         """)
 
-
-init_db()
+        await conn.commit()
 
 
 # =========================================================
@@ -67,20 +94,29 @@ init_db()
 # =========================================================
 
 def load_categories():
+    """Load standardized categories from categories.json."""
+
     if not CATEGORY_FILE.exists():
         raise FileNotFoundError(
-            f"Category resource not found: {CATEGORY_FILE}"
+            f"Category file not found: {CATEGORY_FILE}"
         )
 
     with open(CATEGORY_FILE, "r", encoding="utf-8") as file:
-        return json.load(file)
+        data = json.load(file)
+
+    if not isinstance(data.get("categories"), list):
+        raise ValueError(
+            "categories.json must contain a categories list."
+        )
+
+    return data
 
 
 @mcp.resource("expense://categories")
 def get_expense_categories():
     """
-    Provides the standardized expense categories
-    and their available subcategories.
+    Read-only resource containing expense categories
+    and their supported subcategories.
     """
     return json.dumps(load_categories(), indent=2)
 
@@ -95,33 +131,43 @@ CATEGORY_ALIASES = {
     "restaurants": "Food",
     "dining": "Food",
     "eating out": "Food",
-    "groceries": "Groceries",
+
     "grocery": "Groceries",
+    "groceries": "Groceries",
     "supermarket": "Groceries",
+
     "transport": "Transport",
     "transportation": "Transport",
     "cab": "Transport",
     "taxi": "Transport",
     "uber": "Transport",
     "ola": "Transport",
+
     "shopping": "Shopping",
     "clothes": "Shopping",
     "clothing": "Shopping",
+
     "entertainment": "Entertainment",
     "movies": "Entertainment",
+    "movie": "Entertainment",
     "subscription": "Entertainment",
+
     "health": "Health",
     "medical": "Health",
     "medicine": "Health",
+
     "education": "Education",
     "college": "Education",
     "courses": "Education",
+
     "bills": "Bills",
     "utilities": "Bills",
     "electricity": "Bills",
     "rent": "Bills",
+
     "personal care": "Personal Care",
     "grooming": "Personal Care",
+
     "travel": "Travel",
     "finance": "Finance",
     "other": "Other"
@@ -132,30 +178,42 @@ SUBCATEGORY_ALIASES = {
     "uber": ("Transport", "Cab"),
     "ola": ("Transport", "Cab"),
     "taxi": ("Transport", "Cab"),
+    "cab": ("Transport", "Cab"),
     "metro": ("Transport", "Metro"),
     "bus": ("Transport", "Bus"),
+    "train": ("Transport", "Train"),
     "petrol": ("Transport", "Fuel"),
     "diesel": ("Transport", "Fuel"),
     "fuel": ("Transport", "Fuel"),
+    "parking": ("Transport", "Parking"),
+
     "milk": ("Groceries", "Dairy"),
     "vegetables": ("Groceries", "Vegetables"),
     "fruits": ("Groceries", "Fruits"),
+
     "pizza": ("Food", "Fast Food"),
     "burger": ("Food", "Fast Food"),
     "coffee": ("Food", "Beverages"),
     "tea": ("Food", "Beverages"),
+    "swiggy": ("Food", "Food Delivery"),
+    "zomato": ("Food", "Food Delivery"),
+
     "netflix": ("Entertainment", "Subscriptions"),
     "hotstar": ("Entertainment", "Subscriptions"),
     "prime video": ("Entertainment", "Subscriptions"),
+
     "electricity": ("Bills", "Electricity"),
     "water bill": ("Bills", "Water"),
     "internet": ("Bills", "Internet"),
     "mobile recharge": ("Bills", "Mobile Recharge"),
+
     "medicine": ("Health", "Medicines"),
     "pharmacy": ("Health", "Medicines"),
     "doctor": ("Health", "Doctor Consultation"),
+
     "books": ("Education", "Books"),
     "course": ("Education", "Courses"),
+
     "clothes": ("Shopping", "Clothing"),
     "shoes": ("Shopping", "Footwear")
 }
@@ -163,53 +221,59 @@ SUBCATEGORY_ALIASES = {
 
 def normalize_category(category, subcategory=""):
     """
-    Convert common category variations into standard categories.
+    Map common category variations to canonical categories.
 
-    Unknown categories are stored as Other / Uncategorized.
+    Unknown categories become Other / Uncategorized.
     """
 
     taxonomy = load_categories()
 
-    normalized_category = category.strip().lower()
-    normalized_subcategory = subcategory.strip().lower()
+    raw_category = str(category).strip().lower()
+    raw_subcategory = str(subcategory).strip().lower()
 
-    # Check category aliases.
-    canonical_category = CATEGORY_ALIASES.get(
-        normalized_category
-    )
+    # Recognize a known merchant or expense keyword.
+    if raw_category in SUBCATEGORY_ALIASES:
+        return SUBCATEGORY_ALIASES[raw_category]
 
-    # Check whether the supplied category is already canonical.
+    # Match category aliases.
+    canonical_category = CATEGORY_ALIASES.get(raw_category)
+
+    # Match canonical category names from the JSON resource.
     if not canonical_category:
         for item in taxonomy["categories"]:
-            if item["category"].lower() == normalized_category:
+            if item["category"].lower() == raw_category:
                 canonical_category = item["category"]
                 break
-
-    # Check aliases that identify both category and subcategory.
-    if normalized_category in SUBCATEGORY_ALIASES:
-        canonical_category, canonical_subcategory = (
-            SUBCATEGORY_ALIASES[normalized_category]
-        )
-        return canonical_category, canonical_subcategory
 
     if not canonical_category:
         return "Other", "Uncategorized"
 
-    # Match subcategory against the taxonomy.
-    available_subcategories = []
+    # Find allowed subcategories.
+    allowed = []
 
     for item in taxonomy["categories"]:
         if item["category"] == canonical_category:
-            available_subcategories = item["subcategories"]
+            allowed = item["subcategories"]
             break
 
     canonical_subcategory = ""
 
-    if normalized_subcategory:
-        for item in available_subcategories:
-            if item.lower() == normalized_subcategory:
-                canonical_subcategory = item
-                break
+    if raw_subcategory:
+        # Check subcategory aliases.
+        alias_result = SUBCATEGORY_ALIASES.get(raw_subcategory)
+
+        if alias_result:
+            alias_category, alias_subcategory = alias_result
+
+            if alias_category == canonical_category:
+                canonical_subcategory = alias_subcategory
+
+        # Check exact subcategory names.
+        if not canonical_subcategory:
+            for item in allowed:
+                if item.lower() == raw_subcategory:
+                    canonical_subcategory = item
+                    break
 
         if not canonical_subcategory:
             canonical_subcategory = "Uncategorized"
@@ -242,7 +306,9 @@ def validate_date(value):
 
 def validate_month(value):
     try:
-        return datetime.strptime(value, "%Y-%m").strftime("%Y-%m")
+        return datetime.strptime(
+            value, "%Y-%m"
+        ).strftime("%Y-%m")
     except (ValueError, TypeError):
         raise ValueError("Month must use YYYY-MM format.")
 
@@ -262,10 +328,14 @@ def parse_natural_date(text):
     text = text.lower()
 
     if "day before yesterday" in text:
-        return (date.today() - timedelta(days=2)).isoformat()
+        return (
+            date.today() - timedelta(days=2)
+        ).isoformat()
 
     if "yesterday" in text:
-        return (date.today() - timedelta(days=1)).isoformat()
+        return (
+            date.today() - timedelta(days=1)
+        ).isoformat()
 
     if "today" in text:
         return date.today().isoformat()
@@ -283,7 +353,7 @@ def parse_natural_date(text):
 # =========================================================
 
 @mcp.tool
-def add_expense(
+async def add_expense(
     date: str,
     amount: float,
     category: str,
@@ -291,10 +361,10 @@ def add_expense(
     note: str = ""
 ):
     """
-    Add a structured expense.
+    Add an expense to the database.
 
-    Use the expense://categories resource for the standard
-    category taxonomy. Unknown categories become Other.
+    Use the expense://categories resource for the
+    standardized category and subcategory taxonomy.
     """
 
     expense_date = validate_date(date)
@@ -305,8 +375,9 @@ def add_expense(
         subcategory
     )
 
-    with get_db() as conn:
-        cur = conn.execute("""
+    async with get_db() as conn:
+
+        cursor = await conn.execute("""
             INSERT INTO expenses
             (date, amount, category, subcategory, note)
             VALUES (?, ?, ?, ?, ?)
@@ -318,10 +389,12 @@ def add_expense(
             note.strip()
         ))
 
+        await conn.commit()
+
         return {
             "status": "success",
             "message": "Expense added successfully.",
-            "expense_id": cur.lastrowid,
+            "expense_id": cursor.lastrowid,
             "date": expense_date,
             "amount": expense_amount,
             "category": category,
@@ -334,17 +407,18 @@ def add_expense(
 # =========================================================
 
 @mcp.tool
-def quick_add_expense(utterance: str):
+async def quick_add_expense(utterance: str):
     """
-    Record an expense from natural-language text.
+    Add an expense from natural-language text.
 
     Examples:
     - I spent 250 rupees on groceries today.
     - Paid 120 for coffee yesterday.
-    - Spent 500 on Uber.
+    - Spent ₹500 on Uber.
     - I bought milk for 60 rupees.
 
-    If the amount cannot be identified, ask the user.
+    Ask the user for clarification if the amount or
+    category cannot be confidently identified.
     """
 
     text = utterance.strip()
@@ -356,16 +430,17 @@ def quick_add_expense(utterance: str):
             "message": "Please describe your expense."
         }
 
+    # Detect amount in common Indian currency formats.
     amount_match = re.search(
         r"(?:₹|rs\.?|rupees?)\s*([\d,]+(?:\.\d{1,2})?)"
         r"|([\d,]+(?:\.\d{1,2})?)\s*(?:rupees?|rs\.?)",
         lower
     )
 
-    # Also support phrases such as "spent 250 on food".
+    # Also support: "spent 250 on food".
     if not amount_match:
         amount_match = re.search(
-            r"\b(?:spent|paid|bought|cost|for)\s+"
+            r"\b(?:spent|paid|bought|cost)\s+"
             r"(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)\b",
             lower
         )
@@ -381,29 +456,47 @@ def quick_add_expense(utterance: str):
         if group is not None
     )
 
-    amount = validate_amount(amount_text.replace(",", ""))
+    amount = validate_amount(
+        amount_text.replace(",", "")
+    )
 
-    # Find a recognizable subcategory or alias.
     matched_category = None
     matched_subcategory = ""
 
-    for keyword, pair in SUBCATEGORY_ALIASES.items():
-        if re.search(r"\b" + re.escape(keyword) + r"\b", lower):
-            matched_category, matched_subcategory = pair
+    # Match specific aliases first.
+    for keyword in sorted(
+        SUBCATEGORY_ALIASES,
+        key=len,
+        reverse=True
+    ):
+        if re.search(
+            r"\b" + re.escape(keyword) + r"\b",
+            lower
+        ):
+            matched_category, matched_subcategory = (
+                SUBCATEGORY_ALIASES[keyword]
+            )
             break
 
-    # If no subcategory alias matched, check category keywords.
+    # Otherwise match a general category.
     if not matched_category:
-        for alias, canonical in CATEGORY_ALIASES.items():
-            if re.search(r"\b" + re.escape(alias) + r"\b", lower):
-                matched_category = canonical
+        for alias in sorted(
+            CATEGORY_ALIASES,
+            key=len,
+            reverse=True
+        ):
+            if re.search(
+                r"\b" + re.escape(alias) + r"\b",
+                lower
+            ):
+                matched_category = CATEGORY_ALIASES[alias]
                 break
 
     if not matched_category:
         return {
             "status": "needs_clarification",
             "message": (
-                "I found the amount, but could not identify "
+                "I found the amount but could not identify "
                 "the category. Which category should I use?"
             ),
             "detected_amount": amount
@@ -411,7 +504,7 @@ def quick_add_expense(utterance: str):
 
     expense_date = parse_natural_date(text)
 
-    result = add_expense(
+    result = await add_expense(
         date=expense_date,
         amount=amount,
         category=matched_category,
@@ -431,7 +524,7 @@ def quick_add_expense(utterance: str):
 # =========================================================
 
 @mcp.tool
-def list_expenses(
+async def list_expenses(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     category: Optional[str] = None,
@@ -455,6 +548,7 @@ def list_expenses(
 
     if category:
         canonical, _ = normalize_category(category)
+
         conditions.append("LOWER(category) = LOWER(?)")
         params.append(canonical)
 
@@ -463,13 +557,17 @@ def list_expenses(
         if conditions else ""
     )
 
-    with get_db() as conn:
-        rows = conn.execute(f"""
-            SELECT * FROM expenses
+    async with get_db() as conn:
+
+        cursor = await conn.execute(f"""
+            SELECT *
+            FROM expenses
             {where}
             ORDER BY date DESC, id DESC
             LIMIT ?
-        """, (*params, limit)).fetchall()
+        """, (*params, limit))
+
+        rows = await cursor.fetchall()
 
         return expense_rows(rows)
 
@@ -479,7 +577,7 @@ def list_expenses(
 # =========================================================
 
 @mcp.tool
-def update_expense(
+async def update_expense(
     expense_id: int,
     date: Optional[str] = None,
     amount: Optional[float] = None,
@@ -502,9 +600,10 @@ def update_expense(
 
     if category is not None:
         canonical, canonical_subcategory = normalize_category(
-            category,
+            validate_category(category),
             subcategory or ""
         )
+
         updates["category"] = canonical
 
         if subcategory is None:
@@ -526,13 +625,16 @@ def update_expense(
         f"{column} = ?" for column in updates
     )
 
-    with get_db() as conn:
-        cur = conn.execute(
+    async with get_db() as conn:
+
+        cursor = await conn.execute(
             f"UPDATE expenses SET {columns} WHERE id = ?",
             (*updates.values(), expense_id)
         )
 
-        if cur.rowcount == 0:
+        await conn.commit()
+
+        if cursor.rowcount == 0:
             return {
                 "status": "not_found",
                 "expense_id": expense_id
@@ -550,24 +652,27 @@ def update_expense(
 # =========================================================
 
 @mcp.tool
-def delete_expense(expense_id: int):
+async def delete_expense(expense_id: int):
     """
-    Permanently delete an expense by ID.
+    Delete an expense by ID.
 
-    The assistant should obtain user confirmation before
-    calling this destructive tool.
+    The assistant should obtain user confirmation
+    before calling this destructive tool.
     """
 
     if expense_id <= 0:
         raise ValueError("Expense ID must be positive.")
 
-    with get_db() as conn:
-        cur = conn.execute(
+    async with get_db() as conn:
+
+        cursor = await conn.execute(
             "DELETE FROM expenses WHERE id = ?",
             (expense_id,)
         )
 
-        if cur.rowcount == 0:
+        await conn.commit()
+
+        if cursor.rowcount == 0:
             return {
                 "status": "not_found",
                 "expense_id": expense_id
@@ -585,30 +690,39 @@ def delete_expense(expense_id: int):
 # =========================================================
 
 @mcp.tool
-def get_monthly_summary(month: Optional[str] = None):
+async def get_monthly_summary(
+    month: Optional[str] = None
+):
     """Get monthly spending, transaction count and average."""
 
     month = validate_month(
         month or date.today().strftime("%Y-%m")
     )
 
-    with get_db() as conn:
-        result = conn.execute("""
+    async with get_db() as conn:
+
+        cursor = await conn.execute("""
             SELECT
                 COUNT(*) AS transactions,
                 COALESCE(SUM(amount), 0) AS total,
                 COALESCE(AVG(amount), 0) AS average
             FROM expenses
             WHERE substr(date, 1, 7) = ?
-        """, (month,)).fetchone()
+        """, (month,))
 
-        categories = conn.execute("""
-            SELECT category, SUM(amount) AS total
+        result = await cursor.fetchone()
+
+        cursor = await conn.execute("""
+            SELECT
+                category,
+                SUM(amount) AS total
             FROM expenses
             WHERE substr(date, 1, 7) = ?
             GROUP BY category
             ORDER BY total DESC
-        """, (month,)).fetchall()
+        """, (month,))
+
+        categories = await cursor.fetchall()
 
         return {
             "month": month,
@@ -624,15 +738,18 @@ def get_monthly_summary(month: Optional[str] = None):
 # =========================================================
 
 @mcp.tool
-def category_analysis(month: Optional[str] = None):
+async def category_analysis(
+    month: Optional[str] = None
+):
     """Analyze spending distribution by category."""
 
     month = validate_month(
         month or date.today().strftime("%Y-%m")
     )
 
-    with get_db() as conn:
-        rows = conn.execute("""
+    async with get_db() as conn:
+
+        cursor = await conn.execute("""
             SELECT
                 category,
                 COUNT(*) AS transactions,
@@ -642,7 +759,9 @@ def category_analysis(month: Optional[str] = None):
             WHERE substr(date, 1, 7) = ?
             GROUP BY category
             ORDER BY total DESC
-        """, (month,)).fetchall()
+        """, (month,))
+
+        rows = await cursor.fetchall()
 
         total = sum(row["total"] for row in rows)
 
@@ -673,12 +792,12 @@ def category_analysis(month: Optional[str] = None):
 # =========================================================
 
 @mcp.tool
-def set_budget(
+async def set_budget(
     category: str,
     amount: float,
     month: Optional[str] = None
 ):
-    """Create or update a monthly budget for a category."""
+    """Create or update a monthly category budget."""
 
     category, _ = normalize_category(
         validate_category(category)
@@ -690,13 +809,16 @@ def set_budget(
         month or date.today().strftime("%Y-%m")
     )
 
-    with get_db() as conn:
-        conn.execute("""
+    async with get_db() as conn:
+
+        await conn.execute("""
             INSERT INTO budgets (category, month, amount)
             VALUES (?, ?, ?)
             ON CONFLICT(category, month)
             DO UPDATE SET amount = excluded.amount
         """, (category, month, amount))
+
+        await conn.commit()
 
         return {
             "status": "success",
@@ -711,46 +833,60 @@ def set_budget(
 # =========================================================
 
 @mcp.tool
-def budget_tracker(month: Optional[str] = None):
+async def budget_tracker(
+    month: Optional[str] = None
+):
     """Compare monthly category spending against budgets."""
 
     month = validate_month(
         month or date.today().strftime("%Y-%m")
     )
 
-    with get_db() as conn:
-        budgets = conn.execute("""
+    async with get_db() as conn:
+
+        cursor = await conn.execute("""
             SELECT category, amount
             FROM budgets
             WHERE month = ?
-        """, (month,)).fetchall()
+        """, (month,))
+
+        budgets = await cursor.fetchall()
 
         results = []
 
         for budget in budgets:
-            spent = conn.execute("""
+
+            cursor = await conn.execute("""
                 SELECT COALESCE(SUM(amount), 0)
                 FROM expenses
                 WHERE substr(date, 1, 7) = ?
                 AND LOWER(category) = LOWER(?)
-            """, (month, budget["category"])).fetchone()[0]
+            """, (month, budget["category"]))
 
-            remaining = budget["amount"] - spent
+            spent = (await cursor.fetchone())[0]
+
+            budget_amount = budget["amount"]
+            remaining = budget_amount - spent
+
+            percentage_used = (
+                spent / budget_amount * 100
+                if budget_amount > 0 else 0
+            )
+
+            if remaining < 0:
+                status = "Over budget"
+            elif percentage_used >= 80:
+                status = "Budget exceeded 80%"
+            else:
+                status = "Within budget"
 
             results.append({
                 "category": budget["category"],
-                "budget": round(budget["amount"], 2),
+                "budget": round(budget_amount, 2),
                 "spent": round(spent, 2),
                 "remaining": round(remaining, 2),
-                "percentage_used": round(
-                    spent / budget["amount"] * 100, 2
-                ),
-                "status": (
-                    "Over budget" if remaining < 0
-                    else "Budget exceeded 80%"
-                    if spent / budget["amount"] >= 0.8
-                    else "Within budget"
-                )
+                "percentage_used": round(percentage_used, 2),
+                "status": status
             })
 
         return {
@@ -764,41 +900,50 @@ def budget_tracker(month: Optional[str] = None):
 # =========================================================
 
 @mcp.tool
-def expense_insights(month: Optional[str] = None):
+async def expense_insights(
+    month: Optional[str] = None
+):
     """
     Generate rule-based insights from expense history.
 
-    This tool calculates spending patterns. It does not
-    use a separate machine-learning model.
+    This calculates spending patterns. It does not use
+    a separate machine-learning model.
     """
 
     month = validate_month(
         month or date.today().strftime("%Y-%m")
     )
 
-    with get_db() as conn:
-        total = conn.execute("""
+    async with get_db() as conn:
+
+        cursor = await conn.execute("""
             SELECT COALESCE(SUM(amount), 0)
             FROM expenses
             WHERE substr(date, 1, 7) = ?
-        """, (month,)).fetchone()[0]
+        """, (month,))
 
-        categories = conn.execute("""
+        total = (await cursor.fetchone())[0]
+
+        cursor = await conn.execute("""
             SELECT category, SUM(amount) AS total
             FROM expenses
             WHERE substr(date, 1, 7) = ?
             GROUP BY category
             ORDER BY total DESC
-        """, (month,)).fetchall()
+        """, (month,))
 
-        daily = conn.execute("""
+        categories = await cursor.fetchall()
+
+        cursor = await conn.execute("""
             SELECT date, SUM(amount) AS total
             FROM expenses
             WHERE substr(date, 1, 7) = ?
             GROUP BY date
             ORDER BY total DESC
             LIMIT 1
-        """, (month,)).fetchone()
+        """, (month,))
+
+        daily = await cursor.fetchone()
 
         insights = []
 
@@ -808,7 +953,8 @@ def expense_insights(month: Optional[str] = None):
             )
         else:
             insights.append(
-                f"Your total spending for {month} is ₹{total:.2f}."
+                f"Your total spending for {month} "
+                f"is ₹{total:.2f}."
             )
 
         if categories and total > 0:
@@ -823,8 +969,8 @@ def expense_insights(month: Optional[str] = None):
 
         if daily:
             insights.append(
-                f"Your highest spending day was {daily['date']} "
-                f"with ₹{daily['total']:.2f} spent."
+                f"Your highest spending day was "
+                f"{daily['date']} with ₹{daily['total']:.2f} spent."
             )
 
         return {
@@ -835,8 +981,24 @@ def expense_insights(month: Optional[str] = None):
 
 
 # =========================================================
-# SERVER ENTRY POINT
+# SERVER STARTUP
 # =========================================================
 
+async def main():
+    await init_db()
+
+    print("ExpenseTracker MCP server is starting...")
+    print(f"Host: {HOST}")
+    print(f"Port: {PORT}")
+    print(f"MCP endpoint: http://localhost:{PORT}/mcp")
+
+    await mcp.run_async(
+        transport="http",
+        host=HOST,
+        port=PORT,
+        path="/mcp"
+    )
+
+
 if __name__ == "__main__":
-    mcp.run()
+    asyncio.run(main())
