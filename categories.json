@@ -1,0 +1,115 @@
+
+{
+  "categories": [
+    {
+      "category": "Food",
+      "subcategories": [
+        "Restaurants",
+        "Fast Food",
+        "Groceries",
+        "Snacks",
+        "Beverages",
+        "Food Delivery"
+      ]
+    },
+    {
+      "category": "Transport",
+      "subcategories": [
+        "Cab",
+        "Metro",
+        "Bus",
+        "Train",
+        "Fuel",
+        "Parking",
+        "Vehicle Maintenance"
+      ]
+    },
+    {
+      "category": "Shopping",
+      "subcategories": [
+        "Clothing",
+        "Footwear",
+        "Electronics",
+        "Accessories",
+        "Home Shopping",
+        "Online Shopping"
+      ]
+    },
+    {
+      "category": "Entertainment",
+      "subcategories": [
+        "Movies",
+        "Subscriptions",
+        "Gaming",
+        "Events",
+        "Travel Entertainment"
+      ]
+    },
+    {
+      "category": "Health",
+      "subcategories": [
+        "Medicines",
+        "Doctor Consultation",
+        "Hospital",
+        "Fitness",
+        "Medical Tests"
+      ]
+    },
+    {
+      "category": "Education",
+      "subcategories": [
+        "Books",
+        "Courses",
+        "Tuition",
+        "College Fees",
+        "Learning Subscriptions"
+      ]
+    },
+    {
+      "category": "Bills",
+      "subcategories": [
+        "Electricity",
+        "Water",
+        "Internet",
+        "Mobile Recharge",
+        "Rent",
+        "Gas"
+      ]
+    },
+    {
+      "category": "Personal Care",
+      "subcategories": [
+        "Grooming",
+        "Skincare",
+        "Haircare",
+        "Personal Hygiene"
+      ]
+    },
+    {
+      "category": "Travel",
+      "subcategories": [
+        "Flights",
+        "Hotels",
+        "Accommodation",
+        "Local Transport",
+        "Travel Booking"
+      ]
+    },
+    {
+      "category": "Finance",
+      "subcategories": [
+        "Bank Charges",
+        "Loan Payments",
+        "Insurance",
+        "Taxes"
+      ]
+    },
+    {
+      "category": "Other",
+      "subcategories": [
+        "Uncategorized",
+        "Miscellaneous"
+      ]
+    }
+  ]
+}
